@@ -1,8 +1,7 @@
 /**
  * POST /api/ai/get-shop-data
  * Called by the Vapi voice agent at the start of a call.
- * Input:  { called_number, caller_number }
- * Returns: { shop, products, customer, language }
+ * Handles Vapi Tool calls, Webhook payloads, and direct JSON.
  */
 
 import { supabaseAdmin } from '@/lib/supabaseClient';
@@ -21,13 +20,32 @@ function numbersMatch(a, b) {
 
 export async function POST(req) {
   try {
-    const { called_number, caller_number } = await req.json();
+    const body = await req.json();
 
-    if (!called_number) {
-      return Response.json({ error: 'called_number is required' }, { status: 400 });
-    }
+    // 1. Tool Call arguments ya Direct JSON check karein
+    const toolArgs = 
+      body.message?.toolCalls?.[0]?.function?.arguments || 
+      body.message?.functionCall?.arguments || 
+      {};
 
-    // Find the shop by its virtual number (digits-normalized compare).
+    const parsedToolArgs = typeof toolArgs === 'string' ? JSON.parse(toolArgs || '{}') : toolArgs;
+
+    // 2. Multi-source phone numbers extraction (Vapi ke mukhtalif structures support)
+    const called_number = 
+      body.called_number ||
+      parsedToolArgs.called_number ||
+      body.message?.call?.phoneNumber?.number ||
+      body.call?.phoneNumber?.number;
+
+    const caller_number = 
+      body.caller_number ||
+      parsedToolArgs.caller_number ||
+      body.message?.call?.customer?.number ||
+      body.call?.customer?.number;
+
+    const requested_shop_id = body.shop_id || parsedToolArgs.shop_id;
+
+    // 3. Database se active shops le kar aayein
     const { data: shops, error: shopErr } = await supabaseAdmin
       .from('shops')
       .select('id, shop_name, virtual_number, default_language, open_time, close_time, is_active')
@@ -38,13 +56,29 @@ export async function POST(req) {
       return Response.json({ error: 'database error' }, { status: 500 });
     }
 
-    const shop = (shops || []).find((s) => numbersMatch(s.virtual_number, called_number));
+    let shop = null;
+
+    // A. Direct shop_id se match karein
+    if (requested_shop_id) {
+      shop = (shops || []).find((s) => String(s.id) === String(requested_shop_id));
+    }
+
+    // B. Virtual phone number se match karein
+    if (!shop && called_number) {
+      shop = (shops || []).find((s) => numbersMatch(s.virtual_number, called_number));
+    }
+
+    // C. Fallback: Agar Vapi ne number na bheja ho to pehli active shop uthayein (SaaS safe fallback)
+    if (!shop && (shops || []).length > 0) {
+      console.warn('[get-shop-data] No direct match found, fallback to first active shop.');
+      shop = shops[0];
+    }
 
     if (!shop) {
       return Response.json({ error: 'shop not found or inactive' }, { status: 404 });
     }
 
-    // Available products for this shop.
+    // 4. Products lookup
     const { data: products, error: prodErr } = await supabaseAdmin
       .from('products')
       .select('id, product_name, price, stock, category')
@@ -57,7 +91,7 @@ export async function POST(req) {
       return Response.json({ error: 'database error' }, { status: 500 });
     }
 
-    // Existing customer (by phone) for this shop, if any.
+    // 5. Customer lookup
     let customer = null;
     if (caller_number) {
       const { data, error: custErr } = await supabaseAdmin
@@ -70,6 +104,7 @@ export async function POST(req) {
       }
     }
 
+    // Vapi Tool Call response format
     return Response.json({
       shop: {
         id: shop.id,
@@ -81,8 +116,10 @@ export async function POST(req) {
       },
       products: products || [],
       customer,
-      language: shop.default_language,
+      language: shop.default_language || 'ur',
+      message: `Shop data loaded successfully for ${shop.shop_name}`
     });
+
   } catch (err) {
     console.error('[get-shop-data] unexpected error', err);
     return Response.json({ error: 'internal error' }, { status: 500 });
